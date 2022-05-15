@@ -5,19 +5,29 @@ extern crate ctrlc;
 
 use clap::arg;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::f32::consts::PI;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
+use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let app = clap::Command::new("audioping")
         .arg(arg!(-l --list "List audio devices"))
+        .arg(arg!(-v --volume [VOLUME] "Signal amplitude multiplier 0-100, default: 50"))
+        .arg(arg!(-s --sensitivity [SENSITIVITY] "Signal amplitude required to trigger, default: 1.0"))
         .arg(arg!(-i --input [IN] "The input audio device to use"))
         .arg(arg!(-o --output [OUT] "The output audio device to use"));
 
     let matches = app.get_matches();
     let input_device = matches.value_of("input");
     let output_device = matches.value_of("output");
+
+    let volume_str = matches.value_of("volume").unwrap_or("50");
+    let volume = volume_str.parse::<f32>()?.max(0f32).min(100f32) / 100f32;
+    let sensitivity_str = matches.value_of("sensitivity").unwrap_or("1");
+    let sensitivity = sensitivity_str.parse::<f32>()?.max(0f32).min(2f32);
+
     let (tx, rx) = channel();
     ctrlc::set_handler(move || tx.send(()).expect("Could not send signal on channel."))
         .expect("Error setting Ctrl-C handler");
@@ -62,61 +72,76 @@ fn main() -> anyhow::Result<()> {
     println!("Using output device: \"{}\"", output.name()?);
 
     let config: cpal::StreamConfig = output.default_output_config()?.into();
-    let beep_frames = Arc::new(AtomicU64::new(0));
-    let beep_frames2 = Arc::clone(&beep_frames);
     let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
+    let signal_active = Arc::new(AtomicBool::new(false));
+    let signal_active2 = Arc::clone(&signal_active);
+    let signal_start = Arc::new(AtomicU64::new(0));
+    let signal_start2 = Arc::clone(&signal_start);
+
+    let start_time = Instant::now();
 
     // Input loop
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let (mut total_count, mut amplitude_count) = (0u64, 0u32);
+        let frame_start = start_time.elapsed().as_nanos() as u64;
+
+        let (mut delay_count, mut amplitude_count) = (0u64, 0u32);
         let (mut min, mut max) = (Option::<f32>::None, Option::<f32>::None);
         for frame in data.chunks(channels) {
             let sample = &frame[0];
             min = min.and_then(|x| Some(x.min(*sample))).or(Some(*sample));
             max = max.and_then(|x| Some(x.max(*sample))).or(Some(*sample));
-            if max.unwrap() - min.unwrap() > 1f32 {
-                if amplitude_count > 10 {
-                    break;
-                }
+            if max.unwrap() - min.unwrap() > sensitivity {
                 amplitude_count += 1;
             }
-            total_count += 1;
+            if amplitude_count <= 10 {
+                delay_count += 1;
+            }
         }
+        let amplitude = max.unwrap_or(0f32) - min.unwrap_or(0f32);
         if amplitude_count > 10 {
-            let delay_frames = beep_frames.swap(0, Ordering::SeqCst);
-            if delay_frames > 0 {
-                let delay_ms =
-                    (delay_frames * data.chunks(channels).len() as u64 + total_count) as f32 * 1000.0 / sample_rate;
-                println!("Delay: {} frames, {}ms", delay_frames, delay_ms);
+            let was_active = signal_active.swap(false, Ordering::SeqCst);
+            if was_active {
+                let mut delay_ms = (frame_start - signal_start.load(Ordering::SeqCst)) as f32 / 1000.0;
+                delay_ms += delay_count as f32 * 1000.0 / sample_rate;
+                println!("Delay: {}ms, Signal: {}", delay_ms, amplitude);
             }
         } else if amplitude_count == 0 {
-            beep_frames.store(1, Ordering::SeqCst);
+            let was_active = signal_active.swap(true, Ordering::SeqCst);
+            if !was_active {
+                signal_start.store(0, Ordering::SeqCst);
+            }
         }
     };
 
     // Output loop
     let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        if beep_frames2.load(Ordering::SeqCst) == 0 {
+        if signal_active2.load(Ordering::SeqCst) {
+            // Produce a sinusoid at the specified amplitude.
+            let mut sample_clock = 0f32;
+            let mut next_value = move || {
+                sample_clock = (sample_clock + 1.0) % sample_rate;
+                (sample_clock * 440.0 * 2.0 * PI / sample_rate).sin()
+            };
+            for frame in data.chunks_mut(channels) {
+                let value = next_value() * volume;
+                for sample in frame.iter_mut() {
+                    *sample = value;
+                }
+            }
+            let _ = signal_start2.compare_exchange(
+                0,
+                start_time.elapsed().as_nanos() as u64,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+        } else {
+            // Mute
             for frame in data.chunks_mut(channels) {
                 for sample in frame.iter_mut() {
                     *sample = 0f32;
                 }
             }
-        } else {
-            // Produce a sinusoid of maximum amplitude.
-            let mut sample_clock = 0f32;
-            let mut next_value = move || {
-                sample_clock = (sample_clock + 1.0) % sample_rate;
-                (sample_clock * 440.0 * 2.0 * std::f32::consts::PI / sample_rate).sin()
-            };
-            for frame in data.chunks_mut(channels) {
-                let value = cpal::Sample::from::<f32>(&next_value());
-                for sample in frame.iter_mut() {
-                    *sample = value;
-                }
-            }
-            beep_frames2.fetch_add(1, Ordering::SeqCst);
         }
     };
 
