@@ -83,30 +83,32 @@ fn main() -> anyhow::Result<()> {
 
     // Input loop
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let frame_start = start_time.elapsed().as_nanos() as u64;
+        let frame_start_us = (start_time.elapsed().as_nanos() / 1000) as u64;
+        let signal_start_us = signal_start.load(Ordering::SeqCst) / 1000;
 
-        let (mut delay_count, mut amplitude_count) = (0u64, 0u32);
+        let mut signal_count = 0u32;
+        let mut signal_found = false;
         let (mut min, mut max) = (Option::<f32>::None, Option::<f32>::None);
         for frame in data.chunks(channels) {
             let sample = &frame[0];
             min = min.and_then(|x| Some(x.min(*sample))).or(Some(*sample));
             max = max.and_then(|x| Some(x.max(*sample))).or(Some(*sample));
             if max.unwrap() - min.unwrap() > sensitivity {
-                amplitude_count += 1;
+                signal_found = true;
             }
-            if amplitude_count <= 10 {
-                delay_count += 1;
+            if signal_found {
+                signal_count += 1;
             }
         }
         let amplitude = max.unwrap_or(0f32) - min.unwrap_or(0f32);
-        if amplitude_count > 10 {
+        if signal_found {
             let was_active = signal_active.swap(false, Ordering::SeqCst);
-            if was_active {
-                let mut delay_ms = (frame_start - signal_start.load(Ordering::SeqCst)) as f32 / 1000.0;
-                delay_ms += delay_count as f32 * 1000.0 / sample_rate;
-                println!("Delay: {}ms, Signal: {}", delay_ms, amplitude);
+            if was_active && signal_start_us < frame_start_us {
+                let mut delay_ms = (frame_start_us - signal_start_us) as f32 / 1000.0;
+                delay_ms -= signal_count as f32 * 1000.0 / sample_rate;
+                println!("Delay: {:3.2}ms, Signal: {}", delay_ms, amplitude);
             }
-        } else if amplitude_count == 0 {
+        } else {
             let was_active = signal_active.swap(true, Ordering::SeqCst);
             if !was_active {
                 signal_start.store(0, Ordering::SeqCst);
@@ -154,8 +156,8 @@ fn main() -> anyhow::Result<()> {
     println!("Successfully built streams.");
 
     println!("Starting the input and output streams");
-    input_stream.play()?;
     output_stream.play()?;
+    input_stream.play()?;
 
     println!("Measuring latency... Press Ctrl-C to stop");
     rx.recv().expect("Could not receive from channel.");
